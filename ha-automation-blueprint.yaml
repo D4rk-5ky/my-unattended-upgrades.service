@@ -46,7 +46,7 @@ actions:
           message: "{{ trigger.payload }}"
   - action: mqtt.publish
     data:
-      topic: homeassistant/example-server/power
-      payload: ""
+      topic: homeassistant/server/power/last
+      payload: "{{ trigger.payload }}"
       retain: true
       qos: 0
