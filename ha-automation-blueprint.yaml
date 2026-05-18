@@ -1,0 +1,52 @@
+alias: Server power MQTT router
+description: Different HA actions for shutdown and reboot
+triggers:
+  - trigger: mqtt
+    topic: homeassistant/ubuntu-zfs-import/power
+conditions:
+  - condition: template
+    value_template: "{{ trigger.payload | trim != '' }}"
+actions:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.payload_json.event == 'server_shutdown' }}"
+        sequence:
+          - action: persistent_notification.create
+            data:
+              title: Server shutting down
+              message: "{{ trigger.payload_json.host }} is shutting down."
+              notification_id: server_power_{{ trigger.payload_json.host }}
+          - action: notify.mobile_app_your_phone_name
+            data:
+              title: Server shutting down
+              message: "{{ trigger.payload_json.host }} is shutting down."
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.payload_json.event == 'server_reboot' }}"
+        sequence:
+          - action: persistent_notification.create
+            data:
+              title: Server rebooting
+              message: "{{ trigger.payload_json.host }} is rebooting."
+              notification_id: server_power_{{ trigger.payload_json.host }}
+          - action: notify.mobile_app_your_phone_name
+            data:
+              title: Server rebooting
+              message: "{{ trigger.payload_json.host }} is rebooting."
+    default:
+      - action: persistent_notification.create
+        data:
+          title: Unknown server MQTT event
+          message: "{{ trigger.payload }}"
+          notification_id: server_power_unknown
+      - action: notify.mobile_app_your_phone_name
+        data:
+          title: Unknown server MQTT event
+          message: "{{ trigger.payload }}"
+  - action: mqtt.publish
+    data:
+      topic: homeassistant/ubuntu-zfs-import/power
+      payload: ""
+      retain: true
+      qos: 0
