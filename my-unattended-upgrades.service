@@ -8,7 +8,7 @@ Type=oneshot
 Environment=DEBIAN_FRONTEND=noninteractive
 
 # Always refresh cache first
-ExecStartPre=/usr/bin/apt-get update -y
+ExecStartPre=/usr/bin/apt-get update
 
 # Run unattended-upgrade (safe even if nothing to upgrade)
 ExecStart=/usr/bin/unattended-upgrade --verbose
