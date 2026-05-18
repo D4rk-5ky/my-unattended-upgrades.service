@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from email.message import EmailMessage
+import json
 
 try:
     import paho.mqtt.client as mqtt
@@ -86,6 +87,112 @@ def get_password(value: str | None, env_var: str | None) -> str | None:
         return os.environ.get(env_var)
 
     return None
+
+def get_config_hostname(config) -> str:
+    """
+    Preferred hostname comes from [server] hostname.
+    Falls back to the real OS hostname if not configured.
+    """
+    configured_hostname = get_str(config, "server", "hostname", default="")
+
+    if configured_hostname:
+        return configured_hostname
+
+    return socket.gethostname()
+
+
+def make_safe_id(value: str) -> str:
+    """
+    Make hostname safe for MQTT client_id.
+    Keeps letters, numbers, dash and underscore.
+    Replaces everything else with dash.
+    """
+    safe = ""
+
+    for char in value.strip().lower():
+        if char.isalnum() or char in ["-", "_"]:
+            safe += char
+        else:
+            safe += "-"
+
+    safe = safe.strip("-_")
+
+    if not safe:
+        return "unknown-host"
+
+    return safe
+
+
+def get_event_name_for_action(action: str) -> str:
+    if action == "shutdown":
+        return "server_shutdown"
+
+    if action == "reboot":
+        return "server_reboot"
+
+    config_error("[power] action must be either shutdown or reboot")
+
+
+def render_template(value: str, config) -> str:
+    """
+    Allows config values like:
+    {hostname}
+    {safe_hostname}
+    {action}
+    {event}
+    """
+    hostname = get_config_hostname(config)
+    safe_hostname = make_safe_id(hostname)
+    action = get_str(config, "power", "action", required=True)
+    event = get_event_name_for_action(action)
+
+    try:
+        return value.format(
+            hostname=hostname,
+            safe_hostname=safe_hostname,
+            action=action,
+            event=event,
+        )
+    except KeyError as e:
+        config_error(f"Unknown placeholder in config value: {{{e.args[0]}}}")
+    except Exception as e:
+        config_error(f"Failed to render config template '{value}': {e}")
+
+
+def build_mqtt_message(config) -> str:
+    hostname = get_config_hostname(config)
+    action = get_str(config, "power", "action", required=True)
+    event = get_event_name_for_action(action)
+
+    configured_message = get_str(config, "mqtt", "message", default="auto")
+
+    if configured_message.lower() == "auto" or configured_message.strip() == "":
+        return json.dumps(
+            {
+                "event": event,
+                "host": hostname,
+            },
+            separators=(",", ":"),
+        )
+
+    return render_template(configured_message, config)
+
+
+def get_mqtt_client_id(config) -> str:
+    hostname = get_config_hostname(config)
+    safe_hostname = make_safe_id(hostname)
+
+    configured_client_id = get_str(
+        config,
+        "mqtt",
+        "client_id",
+        default="auto",
+    )
+
+    if configured_client_id.lower() == "auto" or configured_client_id.strip() == "":
+        return f"mqtt-power-action-{safe_hostname}"
+
+    return render_template(configured_client_id, config)
 
 
 def load_config(path: str):
@@ -177,8 +284,10 @@ def publish_mqtt(config) -> tuple[bool, str]:
     password = get_str(config, "mqtt", "password", default="")
     password_env = get_str(config, "mqtt", "password_env", default="")
     topic = get_str(config, "mqtt", "topic", required=True)
-    message = get_str(config, "mqtt", "message", required=True)
-    client_id = get_str(config, "mqtt", "client_id", default="mqtt-power-action")
+    topic = render_template(topic, config)
+
+    message = build_mqtt_message(config)
+    client_id = get_mqtt_client_id(config)
     qos = get_int(config, "mqtt", "qos", default=1)
     retain = get_bool(config, "mqtt", "retain", default=False)
     connect_timeout = get_float(config, "mqtt", "connect_timeout", default=10.0)
@@ -251,12 +360,10 @@ def find_sendmail(path: str | None) -> str | None:
 
 
 def build_mail_message(config, mail_type: str, details: str) -> EmailMessage:
-    hostname = socket.gethostname()
+    hostname = get_config_hostname(config)
 
     action = get_str(config, "power", "action", required=True)
 
-    mqtt_host = get_str(config, "mqtt", "host", default="")
-    mqtt_port = get_int(config, "mqtt", "port", default=1883)
     mqtt_topic = get_str(config, "mqtt", "topic", default="")
     mqtt_message = get_str(config, "mqtt", "message", default="")
 
@@ -270,29 +377,28 @@ def build_mail_message(config, mail_type: str, details: str) -> EmailMessage:
 
     if not mail_from:
         mail_from = f"root@{hostname}"
-
     if mail_type == "success":
         subject = get_str(
             config,
             "mail",
             "success_subject",
-            default=f"SUCCESS: MQTT before {action} on {hostname}",
+            default="{hostname}: SUCCESS MQTT before {action}",
         )
     else:
         subject = get_str(
             config,
             "mail",
             "failure_subject",
-            default=f"FAILURE: MQTT/power action on {hostname}",
+            default="{hostname}: FAILURE MQTT/power action",
         )
+
+    subject = render_template(subject, config)
 
     body = f"""Power action script status: {mail_type.upper()}
 
 Host: {hostname}
 Action: {action}
 
-MQTT host: {mqtt_host}
-MQTT port: {mqtt_port}
 MQTT topic: {mqtt_topic}
 MQTT message: {mqtt_message}
 
