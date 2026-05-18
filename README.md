@@ -745,7 +745,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-´´´
+```
 
 ### Step 5.2
 
@@ -753,7 +753,7 @@ The config that uses python mail
 
 sudo nano /etc/mqtt-power-action.cfg
 
-```python
+```config
 [power]
 # shutdown or reboot
 action = shutdown
