@@ -46,7 +46,7 @@ actions:
           message: "{{ trigger.payload }}"
   - action: mqtt.publish
     data:
-      topic: homeassistant/ubuntu-zfs-import/power
-      payload: ""
+      topic: homeassistant/server/power/last
+      payload: "{{ trigger.payload }}"
       retain: true
       qos: 0
