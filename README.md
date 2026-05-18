@@ -101,6 +101,12 @@ sudo systemctl mask apt-daily.service apt-daily-upgrade.service
 
 # Make sure APT::Periodic is not re-enabling anything
 sudo sed -i 's/^\s*APT::Periodic::/#&/g' /etc/apt/apt.conf.d/20auto-upgrades
+
+# Also stop the background APT services:
+sudo systemctl mask apt-daily.service sudo systemctl mask apt-daily-upgrade.service
+
+# This _guarantees_ nothing will run automatically without your say-so.
+
 ```
 
 ### Step 2
@@ -113,7 +119,7 @@ I remove unsued dependecies
 Autofix errors
 take it in small steps
 I Send mail on succes
-to remove kernelrelated packages. This is usually done using apt autoremove.
+remove kernel related packages. This is usually done using apt autoremove.
 remove unneeded dependancies. Also manually done with apt autoremove.
 remove unused packages, also, apt autoremove.
 
@@ -753,7 +759,7 @@ The config that uses python mail
 
 sudo nano /etc/mqtt-power-action.cfg
 
-```config
+```bash
 [power]
 # shutdown or reboot
 action = shutdown
@@ -838,7 +844,7 @@ path =
 
 The config that uses postfix
 
-```python
+```bash
 [power]
 action = reboot
 delay_before_action = 1
@@ -875,4 +881,32 @@ extra_body = Sent from local sendmail/Postfix.
 
 [sendmail]
 path =
+```
+
+----
+
+### Step 6
+
+Depending on the setup you use one of the two schutodwn scripts, and in case of mqtt u choose if u use SMTP or Postfix config file.
+
+You set the script in the my-unattended-upgrades.service file.
+
+Make sure to make it executable, and it is invoked as
+
+```bash
+
+sudo /usr/local/bin/mqtt_power_action.py -c /etc/mqtt-power-action.cfg
+
+# Install
+sudo apt install python3-paho-mqtt
+
+# For local sendmail/Postfix mail:
+
+sudo apt install postfix
+
+# Remember to change:
+
+dry_run = false
+
+# when you want the script to actually shutdown or reboot.
 ```
