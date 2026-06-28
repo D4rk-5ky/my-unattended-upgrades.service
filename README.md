@@ -58,7 +58,7 @@ This project may run commands as root and may shut down or reboot your system.
 
 Read everything before using it.
 
-> ⚠️ AI-assisted / vibe-coded experimental software. Use at your own risk.
+⚠️ AI-assisted / vibe-coded experimental software. Use at your own risk.
 
 ## Disclaimer
 
