@@ -1,52 +1,67 @@
-alias: Server power MQTT router
-description: Different HA actions for shutdown and reboot
+alias: My unattended-upgrades - JSON status router
+description: >-
+  Handle the single Syncerate-style JSON status topic from my-unattended-upgrades.
+  Replace the example success action with the next command in your own sequence.
 triggers:
   - trigger: mqtt
-    topic: homeassistant/example-server/power
-conditions:
-  - condition: template
-    value_template: "{{ trigger.payload | trim != '' }}"
+    id: unattended_upgrades_status
+    topic: homeassistant/my-unattended-upgrades/proxmox/status
+conditions: []
 actions:
+  - variables:
+      report: >-
+        {{ trigger.payload_json
+           if trigger.payload_json is defined and trigger.payload_json is mapping
+           else {} }}
+      mqtt_status: "{{ report.status | default('unknown') | string | trim | lower }}"
+      report_title: >-
+        {{ report.title
+           | default(report.name
+           | default(report.job | default('my-unattended-upgrades'))) }}
+
   - choose:
       - conditions:
           - condition: template
-            value_template: "{{ trigger.payload_json.event == 'server_shutdown' }}"
+            value_template: "{{ mqtt_status == 'success' }}"
         sequence:
           - action: persistent_notification.create
             data:
-              title: Server shutting down
-              message: "{{ trigger.payload_json.host }} is shutting down."
-              notification_id: server_power_{{ trigger.payload_json.host }}
-          - action: notify.mobile_app_your_phone_name
-            data:
-              title: Server shutting down
-              message: "{{ trigger.payload_json.host }} is shutting down."
+              title: "✅ Unattended-upgrades succeeded"
+              message: >-
+                {{ report_title }} finished successfully.
+                Exit code: {{ report.exit_code | default('unknown') }}.
+                {% if report.warning | default(false) | bool(false) %}
+                One or more non-fatal warnings occurred.
+                {% endif %}
+
+          # Example: start the next job after this app reports success.
+          # - action: mqtt.publish
+          #   data:
+          #     topic: homeassistant/mqtt-listener/your-host
+          #     payload: start_next_job
+          #     qos: 0
+          #     retain: false
+
       - conditions:
           - condition: template
-            value_template: "{{ trigger.payload_json.event == 'server_reboot' }}"
+            value_template: "{{ mqtt_status == 'failure' }}"
         sequence:
           - action: persistent_notification.create
             data:
-              title: Server rebooting
-              message: "{{ trigger.payload_json.host }} is rebooting."
-              notification_id: server_power_{{ trigger.payload_json.host }}
-          - action: notify.mobile_app_your_phone_name
-            data:
-              title: Server rebooting
-              message: "{{ trigger.payload_json.host }} is rebooting."
+              title: "❌ Unattended-upgrades failed"
+              message: >-
+                {{ report_title }} failed.
+                Exit code: {{ report.exit_code | default('unknown') }}.
+                Error: {{ report.error | default('No error message') }}
+                Last stderr/output: {{ report.stderr | default('No stderr captured') }}
+
     default:
       - action: persistent_notification.create
         data:
-          title: Unknown server MQTT event
-          message: "{{ trigger.payload }}"
-          notification_id: server_power_unknown
-      - action: notify.mobile_app_your_phone_name
-        data:
-          title: Unknown server MQTT event
-          message: "{{ trigger.payload }}"
-  - action: mqtt.publish
-    data:
-      topic: homeassistant/server/power/last
-      payload: "{{ trigger.payload }}"
-      retain: true
-      qos: 0
+          title: "❔ Unattended-upgrades status unknown"
+          message: >-
+            Received a status that was neither success nor failure.
+            Topic: {{ trigger.topic }}
+            Raw payload: {{ trigger.payload | default('No payload') }}
+mode: queued
+max: 10
