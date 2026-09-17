@@ -1,21 +1,29 @@
 [Unit]
-Description=Run unattended-upgrades under my control
+Description=Run unattended-upgrades under custom control with MQTT JSON status
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
 Environment=DEBIAN_FRONTEND=noninteractive
+# Optional secrets used by password_env settings in the config.
+EnvironmentFile=-/etc/mqtt-power-action.env
 
-# Always refresh cache first
+# Refresh package metadata. No automatic yes flag is needed for apt-get update.
 ExecStartPre=/usr/bin/apt-get update
 
-# Run unattended-upgrade (safe even if nothing to upgrade)
+# Run unattended-upgrades. A non-zero exit skips ExecStartPost and is reported by
+# ExecStopPost through the same Syncerate-style MQTT JSON status channel.
 ExecStart=/usr/bin/unattended-upgrade --verbose
 
-# Shutdown only if UA exited 0 (success)
-ExecStartPost=/usr/local/sbin/ua-shutdown-on-success.sh
+# Only reached after ExecStartPre and ExecStart succeeded. This handles optional success
+# mail, publishes the one JSON success status, and then applies [power] action.
+ExecStartPost=/usr/local/bin/mqtt-power-action.py -c /etc/mqtt-power-action.cfg
 
-# Optional niceness
+# systemd supplies SERVICE_RESULT, EXIT_CODE, and EXIT_STATUS here. The same helper detects
+# this ExecStopPost context, emits only failure notification(s), and never performs a power
+# action from this invocation.
+ExecStopPost=/usr/local/bin/mqtt-power-action.py -c /etc/mqtt-power-action.cfg
+
 Nice=10
 IOSchedulingClass=idle
