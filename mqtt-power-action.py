@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
+"""MQTT/mail notification and optional power action for my-unattended-upgrades."""
 
-# This script sends an MQTT message before performing a shutdown or reboot.
-# It can also send success/failure mail through either local sendmail/Postfix or SMTP.
-# The behavior is controlled by an external config file passed with -c / --config.
-
-# Standard library imports used for config parsing, mail, networking,
-# subprocess calls, timing, and command-line arguments.
 import argparse
 import configparser
+import json
 import os
 import shutil
 import smtplib
@@ -18,410 +14,342 @@ import sys
 import threading
 import time
 from email.message import EmailMessage
-import json
+
+PROJECT_VERSION = "0.0.2"
+STATUS_JOB_NAME = "my-unattended-upgrades"
+STATUS_STDERR_LIMIT = 4000
+DEPRECATED_MQTT_OPTIONS = (
+    "message",
+    "qos",
+    "retain",
+    "json_status_enabled",
+    "json_status_topic",
+    "json_status_title",
+)
 
 try:
     import paho.mqtt.client as mqtt
 except ImportError:
-    print("ERROR: Missing paho-mqtt. Install with: sudo apt install python3-paho-mqtt")
-    sys.exit(1)
+    mqtt = None
 
 
-# Print a config-related error and exit with code 2.
-# This keeps all config validation failures consistent.
 def config_error(message: str):
+    """Print a configuration error and terminate with exit code 2."""
     print(f"CONFIG ERROR: {message}")
     sys.exit(2)
 
 
-# Read a string option from the config file.
-# Handles missing sections/options, default values, and required values.
 def get_str(config, section, option, default=None, required=False):
-    # If the whole section is missing, either fail for required values
-    # or return the provided default.
+    """Read a stripped string option, honoring defaults and required values."""
     if not config.has_section(section):
         if required:
             config_error(f"Missing section [{section}]")
         return default
 
-    # If the option is missing inside an existing section, either fail
-    # for required values or return the provided default.
     if not config.has_option(section, option):
         if required:
             config_error(f"Missing option '{option}' in section [{section}]")
         return default
 
-    # Strip whitespace so values like " reboot " are treated as "reboot".
     value = config.get(section, option).strip()
-
     if required and value == "":
         config_error(f"Option '{option}' in section [{section}] cannot be empty")
-
     return value
 
 
-# Read an integer option from the config file.
-# It reuses get_str() first, then validates that the value can be converted to int.
 def get_int(config, section, option, default=None, required=False):
+    """Read an integer option and turn invalid values into a config error."""
     value = get_str(config, section, option, default=None, required=required)
-
     if value is None:
         return default
-
     try:
         return int(value)
     except ValueError:
         config_error(f"Option '{option}' in section [{section}] must be an integer")
 
 
-# Read a floating point number from the config file.
-# Used for timeout and delay values where decimal numbers are allowed.
 def get_float(config, section, option, default=None, required=False):
+    """Read a floating-point option and turn invalid values into a config error."""
     value = get_str(config, section, option, default=None, required=required)
-
     if value is None:
         return default
-
     try:
         return float(value)
     except ValueError:
         config_error(f"Option '{option}' in section [{section}] must be a number")
 
 
-# Read a boolean option from the config file.
-# configparser accepts values like true/false, yes/no, and 1/0.
 def get_bool(config, section, option, default=False):
+    """Read a configparser boolean option."""
     if not config.has_section(section) or not config.has_option(section, option):
         return default
-
     try:
         return config.getboolean(section, option)
     except ValueError:
-        config_error(f"Option '{option}' in section [{section}] must be true/false, yes/no, or 1/0")
+        config_error(
+            f"Option '{option}' in section [{section}] must be true/false, yes/no, or 1/0"
+        )
 
 
-# Choose a password from either a direct config value or an environment variable.
-# Direct config password takes priority; password_env is used when password is empty.
 def get_password(value: str | None, env_var: str | None) -> str | None:
+    """Resolve a password from the direct value first, then from an environment variable."""
     if value:
         return value
-
     if env_var:
         return os.environ.get(env_var)
-
     return None
 
-# Decide which hostname the script should use in MQTT messages,
-# MQTT client IDs, mail subjects, and mail bodies.
+
 def get_config_hostname(config) -> str:
-    """
-    Preferred hostname comes from [server] hostname.
-    Falls back to the real OS hostname if not configured.
-    """
-    # [server] hostname lets you override the OS hostname in messages.
+    """Return configured friendly hostname, falling back to the OS hostname."""
     configured_hostname = get_str(config, "server", "hostname", default="")
-
-    if configured_hostname:
-        return configured_hostname
-
-    # Fallback: use the machine's current OS hostname.
-    return socket.gethostname()
+    return configured_hostname or socket.gethostname()
 
 
-# Convert a hostname or text value into something safe for an MQTT client_id.
-# This avoids spaces and special characters causing broker/client problems.
 def make_safe_id(value: str) -> str:
-    """
-    Make hostname safe for MQTT client_id.
-    Keeps letters, numbers, dash and underscore.
-    Replaces everything else with dash.
-    """
-    # Build a cleaned string character by character.
+    """Make text safe for generated MQTT client IDs and topic path components."""
     safe = ""
-
-    # Lowercase the value and remove leading/trailing whitespace first.
     for char in value.strip().lower():
-        if char.isalnum() or char in ["-", "_"]:
-            safe += char
-        # Normal SMTP connection, usually upgraded with STARTTLS.
-        else:
-            safe += "-"
-
+        safe += char if (char.isalnum() or char in ["-", "_"]) else "-"
     safe = safe.strip("-_")
-
-    if not safe:
-        return "unknown-host"
-
-    return safe
+    return safe or "unknown-host"
 
 
-# Convert the configured power action into the event name sent to Home Assistant.
-# shutdown becomes server_shutdown, reboot becomes server_reboot.
-def get_event_name_for_action(action: str) -> str:
-    # Translate the config action into the actual systemctl command.
-    if action == "shutdown":
-        return "server_shutdown"
-
-    if action == "reboot":
-        return "server_reboot"
-
-    config_error("[power] action must be either shutdown or reboot")
-
-
-# Replace placeholders in config values.
-# Example: homeassistant/{safe_hostname}/power becomes host-specific automatically.
 def render_template(value: str, config) -> str:
-    """
-    Allows config values like:
-    {hostname}
-    {safe_hostname}
-    {action}
-    {event}
-    """
+    """Render supported placeholders in MQTT topics/titles, client IDs, and mail subjects."""
     hostname = get_config_hostname(config)
     safe_hostname = make_safe_id(hostname)
-    # Validate the power action early so no wrong command is executed later.
     action = get_str(config, "power", "action", required=True)
-    event = get_event_name_for_action(action)
 
     try:
         return value.format(
             hostname=hostname,
             safe_hostname=safe_hostname,
             action=action,
-            event=event,
         )
-    except KeyError as e:
-        config_error(f"Unknown placeholder in config value: {{{e.args[0]}}}")
-    # Catch any other unexpected power-action failure.
-    except Exception as e:
-        config_error(f"Failed to render config template '{value}': {e}")
+    except KeyError as exc:
+        config_error(f"Unknown placeholder in config value: {{{exc.args[0]}}}")
+    except Exception as exc:
+        config_error(f"Failed to render config template '{value}': {exc}")
 
 
-# Build the MQTT payload.
-# If [mqtt] message is auto or empty, the script creates a compact JSON message.
-def build_mqtt_message(config) -> str:
-    hostname = get_config_hostname(config)
-    action = get_str(config, "power", "action", required=True)
-    event = get_event_name_for_action(action)
-
-    # "auto" means the script generates the JSON payload itself.
-    configured_message = get_str(config, "mqtt", "message", default="auto")
-
-    # Empty message is treated the same as auto.
-    if configured_message.lower() == "auto" or configured_message.strip() == "":
-        return json.dumps(
-            {
-                "event": event,
-                "host": hostname,
-            },
-            separators=(",", ":"),
-        )
-
-    return render_template(configured_message, config)
+def is_dry_run(config) -> bool:
+    """Return the helper dry-run setting used by power and notification delivery gates."""
+    return get_bool(config, "power", "dry_run", default=False)
 
 
-# Build the MQTT client ID.
-# If [mqtt] client_id is auto or empty, a hostname-based client ID is generated.
+def mqtt_enabled(config) -> bool:
+    """Return whether the single Syncerate-style MQTT JSON status channel is enabled."""
+    return get_bool(config, "mqtt", "enabled", default=True)
+
+
 def get_mqtt_client_id(config) -> str:
+    """Build the configured or automatic MQTT client ID."""
     hostname = get_config_hostname(config)
     safe_hostname = make_safe_id(hostname)
-
-    # client_id can also be auto or a template using placeholders.
-    configured_client_id = get_str(
-        config,
-        "mqtt",
-        "client_id",
-        default="auto",
-    )
+    configured_client_id = get_str(config, "mqtt", "client_id", default="auto")
 
     if configured_client_id.lower() == "auto" or configured_client_id.strip() == "":
         return f"mqtt-power-action-{safe_hostname}"
-
     return render_template(configured_client_id, config)
 
 
-# Load and validate the config file before any MQTT, mail, or power action happens.
-# This catches invalid options early instead of failing halfway through execution.
+def build_mqtt_status_payload(
+    config,
+    *,
+    success: bool,
+    exit_code: int,
+    error_message: str = "",
+    stderr_text: str = "",
+    warning: bool = False,
+) -> str:
+    """Build the only MQTT payload format: compact Syncerate-compatible JSON status."""
+    title_template = get_str(
+        config,
+        "mqtt",
+        "title",
+        default="{hostname} unattended-upgrades",
+    )
+    title = render_template(title_template, config)
+    bounded_stderr = (stderr_text or "")[-STATUS_STDERR_LIMIT:]
+    payload = {
+        "status": "success" if success else "failure",
+        "success": bool(success),
+        "title": title,
+        "name": title,
+        "job": STATUS_JOB_NAME,
+        "exit_code": int(exit_code),
+        "error": error_message or "",
+        "stderr": bounded_stderr,
+        "warning": bool(warning),
+        "skipped_datasets": [],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 def load_config(path: str):
+    """Load and validate all settings before MQTT, mail, or power actions are attempted."""
     config = configparser.ConfigParser(interpolation=None)
-
-    # config.read() returns a list of files successfully loaded.
     files_read = config.read(path)
-
-    # If no file was read, the path is probably wrong or unreadable.
     if not files_read:
         config_error(f"Could not read config file: {path}")
 
     action = get_str(config, "power", "action", required=True)
+    if action not in ["shutdown", "reboot", "none"]:
+        config_error("[power] action must be shutdown, reboot, or none")
 
-    if action not in ["shutdown", "reboot"]:
-        config_error("[power] action must be either shutdown or reboot")
+    # Validate numeric values early even if they will be skipped for action=none/dry-run.
+    delay_before_action = get_float(config, "power", "delay_before_action", default=1.0)
+    if delay_before_action < 0:
+        config_error("[power] delay_before_action cannot be negative")
 
-    # MQTT QoS must be one of the official MQTT levels.
-    qos = get_int(config, "mqtt", "qos", default=1)
+    if config.has_section("mqtt"):
+        for option in DEPRECATED_MQTT_OPTIONS:
+            if config.has_option("mqtt", option):
+                config_error(
+                    f"[mqtt] {option} is obsolete in 0.0.2; only the JSON status format is supported"
+                )
 
-    if qos not in [0, 1, 2]:
-        config_error("[mqtt] qos must be 0, 1, or 2")
+    if mqtt_enabled(config):
+        get_str(config, "mqtt", "host", required=True)
+        render_template(get_str(config, "mqtt", "topic", required=True), config)
+        render_template(
+            get_str(config, "mqtt", "title", default="{hostname} unattended-upgrades"),
+            config,
+        )
+        get_mqtt_client_id(config)
+        port = get_int(config, "mqtt", "port", default=1883)
+        if port < 1 or port > 65535:
+            config_error("[mqtt] port must be between 1 and 65535")
+        if get_float(config, "mqtt", "connect_timeout", default=10.0) <= 0:
+            config_error("[mqtt] connect_timeout must be greater than 0")
+        if get_float(config, "mqtt", "publish_timeout", default=10.0) <= 0:
+            config_error("[mqtt] publish_timeout must be greater than 0")
 
-    # Mail can be handled locally by sendmail/Postfix or directly via SMTP.
     mail_backend = get_str(config, "mail", "backend", default="sendmail")
-
     if mail_backend not in ["sendmail", "smtp"]:
         config_error("[mail] backend must be either sendmail or smtp")
 
-    # These flags decide whether success/failure mails are sent.
     mail_on_success = get_bool(config, "mail", "on_success", default=False)
     mail_on_failure = get_bool(config, "mail", "on_failure", default=False)
     mail_to = get_str(config, "mail", "to", default="")
-
     if (mail_on_success or mail_on_failure) and not mail_to:
         config_error("[mail] to is required when on_success or on_failure is enabled")
 
-    # SMTP needs login details before it can send mail.
     if (mail_on_success or mail_on_failure) and mail_backend == "smtp":
         smtp_username = get_str(config, "smtp", "username", default="")
         smtp_password = get_str(config, "smtp", "password", default="")
         smtp_password_env = get_str(config, "smtp", "password_env", default="")
-
         if not smtp_username:
             config_error("[smtp] username is required when [mail] backend = smtp")
-
         if not smtp_password and not smtp_password_env:
-            config_error("[smtp] password or password_env is required when [mail] backend = smtp")
+            config_error(
+                "[smtp] password or password_env is required when [mail] backend = smtp"
+            )
+        smtp_port = get_int(config, "smtp", "port", default=587)
+        if smtp_port < 1 or smtp_port > 65535:
+            config_error("[smtp] port must be between 1 and 65535")
+        if get_float(config, "smtp", "timeout", default=20.0) <= 0:
+            config_error("[smtp] timeout must be greater than 0")
 
     return config
 
 
-# Create a paho-mqtt client in a way that works with both paho-mqtt v1 and v2.
-# v2 uses CallbackAPIVersion.VERSION2, while v1 does not support that argument.
 def make_mqtt_client(client_id: str | None):
-    """
-    Compatible with paho-mqtt v1 and v2.
-    """
+    """Create a paho client compatible with both paho-mqtt v1 and v2."""
+    if mqtt is None:
+        raise RuntimeError(
+            "Missing paho-mqtt. Install with: sudo apt install python3-paho-mqtt"
+        )
     try:
         return mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id=client_id or "",
         )
-    # Fallback for older paho-mqtt versions.
     except (AttributeError, TypeError):
         return mqtt.Client(client_id=client_id or "")
 
 
-# Normalize different paho-mqtt connection result formats into a simple integer.
-# A result of 0 means success; non-zero means failure.
 def reason_code_to_int(reason_code) -> int:
+    """Normalize paho v1/v2 reason-code objects to an integer return code."""
     try:
         return int(reason_code)
     except Exception:
         pass
-
-    # Some paho objects store the actual numeric value in .value.
     if hasattr(reason_code, "value"):
         try:
             return int(reason_code.value)
         except Exception:
             pass
-
     if str(reason_code).lower() in ["success", "0"]:
         return 0
-
     return 1
 
 
-# Wait until MQTT publish completes.
-# Some paho-mqtt versions support a timeout argument and some do not.
 def wait_for_publish_compatible(info, timeout: float):
+    """Wait for publish completion across paho versions with different call signatures."""
     try:
         info.wait_for_publish(timeout=timeout)
     except TypeError:
         info.wait_for_publish()
 
 
-# Connect to the MQTT broker and publish the power-action message.
-# Returns a success flag and a human-readable details string.
-def publish_mqtt(config) -> tuple[bool, str]:
-    # Read all MQTT settings from the config.
+def publish_mqtt_payload(
+    config,
+    *,
+    topic: str,
+    payload: str,
+) -> tuple[bool, str]:
+    """Connect and publish one non-retained QoS-0 JSON status payload."""
+    if mqtt is None:
+        return False, (
+            "Missing paho-mqtt. Install with: sudo apt install python3-paho-mqtt"
+        )
+
     host = get_str(config, "mqtt", "host", required=True)
     port = get_int(config, "mqtt", "port", default=1883)
     username = get_str(config, "mqtt", "username", default="")
     password = get_str(config, "mqtt", "password", default="")
     password_env = get_str(config, "mqtt", "password_env", default="")
-    topic = get_str(config, "mqtt", "topic", required=True)
-    # Allow the topic to include placeholders like {safe_hostname}.
-    topic = render_template(topic, config)
-
-    # Build message and client ID after reading MQTT connection settings.
-    message = build_mqtt_message(config)
-    client_id = get_mqtt_client_id(config)
-    qos = get_int(config, "mqtt", "qos", default=1)
-    retain = get_bool(config, "mqtt", "retain", default=False)
     connect_timeout = get_float(config, "mqtt", "connect_timeout", default=10.0)
     publish_timeout = get_float(config, "mqtt", "publish_timeout", default=10.0)
-
-    # Resolve password from config or environment before connecting.
+    client_id = get_mqtt_client_id(config)
     real_password = get_password(password, password_env)
 
-    # Event object lets the main thread wait until on_connect has fired.
     connected_event = threading.Event()
-    # Dict is used so the callback can update the connection result.
     connect_result = {"rc": None}
-
-    # Create a paho client with the generated or configured client_id.
     client = make_mqtt_client(client_id)
 
-    # Only enable MQTT username/password auth when username is set.
     if username:
         client.username_pw_set(username, real_password)
 
-    # Callback called by paho-mqtt after the broker accepts or rejects connection.
     def on_connect(client, userdata, flags, reason_code, properties=None):
-        rc = reason_code_to_int(reason_code)
-        connect_result["rc"] = rc
+        connect_result["rc"] = reason_code_to_int(reason_code)
         connected_event.set()
 
     client.on_connect = on_connect
 
     try:
-        # Start the TCP/MQTT connection to the broker.
         client.connect(host, port, keepalive=30)
-        # Start the paho network loop so callbacks and publish handling work.
         client.loop_start()
 
-        # Wait for on_connect, but do not wait forever.
         if not connected_event.wait(connect_timeout):
             return False, "Timed out waiting for MQTT connection."
-
-        # Non-zero return code means the broker rejected the connection.
         if connect_result["rc"] != 0:
             return False, f"MQTT broker rejected connection. RC={connect_result['rc']}"
 
-        # Publish the payload to the configured topic.
-        info = client.publish(
-            topic,
-            payload=message,
-            qos=qos,
-            retain=retain,
-        )
-
-        # Immediate publish errors are reported here.
+        # Run-result events must never be retained; a stale success/failure event could
+        # otherwise replay when Home Assistant reconnects and incorrectly advance a chain.
+        info = client.publish(topic, payload=payload, qos=0, retain=False)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             return False, f"MQTT publish failed. RC={info.rc}"
 
-        # Wait until paho confirms the message was sent.
         wait_for_publish_compatible(info, publish_timeout)
-
-        # If still not published after waiting, treat it as a timeout.
         if not info.is_published():
             return False, "MQTT publish timed out."
-
-        return True, "MQTT message published successfully."
-
-    except Exception as e:
-        return False, f"MQTT publish failed: {e}"
-
-    # Always try to disconnect and stop the network loop, even after errors.
+        return True, f"MQTT JSON status published successfully to {topic}."
+    except Exception as exc:
+        return False, f"MQTT publish failed: {exc}"
     finally:
         try:
             client.disconnect()
@@ -430,141 +358,135 @@ def publish_mqtt(config) -> tuple[bool, str]:
             pass
 
 
-# Locate the sendmail binary.
-# A custom path from config wins; otherwise common system paths and PATH are checked.
+def publish_mqtt_status(
+    config,
+    *,
+    success: bool,
+    exit_code: int,
+    error_message: str = "",
+    stderr_text: str = "",
+    warning: bool = False,
+) -> tuple[bool, str]:
+    """Publish the single JSON status channel, respecting enable and dry-run delivery settings."""
+    if not mqtt_enabled(config):
+        return True, "MQTT JSON status is disabled."
+
+    if is_dry_run(config) and not get_bool(
+        config, "mqtt", "send_on_dry_run", default=False
+    ):
+        return True, "DRY-RUN: MQTT JSON status not sent (send_on_dry_run=false)."
+
+    topic = render_template(get_str(config, "mqtt", "topic", required=True), config)
+    payload = build_mqtt_status_payload(
+        config,
+        success=success,
+        exit_code=exit_code,
+        error_message=error_message,
+        stderr_text=stderr_text,
+        warning=warning,
+    )
+    return publish_mqtt_payload(config, topic=topic, payload=payload)
+
+
 def find_sendmail(path: str | None) -> str | None:
-    # A manually configured sendmail path is trusted first.
+    """Locate a configured or common sendmail-compatible binary."""
     if path:
         return path
-
-    # These are common locations for sendmail-compatible binaries.
     for possible_path in ["/usr/sbin/sendmail", "/usr/bin/sendmail"]:
         if os.path.exists(possible_path):
             return possible_path
-
     return shutil.which("sendmail")
 
 
-# Build the email body and headers for success or failure notifications.
-# This function only creates the message; another function actually sends it.
 def build_mail_message(config, mail_type: str, details: str) -> EmailMessage:
+    """Build the plain-text success/failure email for the current JSON-status workflow."""
     hostname = get_config_hostname(config)
-
     action = get_str(config, "power", "action", required=True)
-
-    # Include MQTT topic/message in the mail body for troubleshooting.
-    mqtt_topic = render_template(
-        get_str(config, "mqtt", "topic", default=""),
-        config,
-    )
-    mqtt_message = build_mqtt_message(config)
-    
-    # Check which mail backend the config selected.
     backend = get_str(config, "mail", "backend", default="sendmail")
     mail_to = get_str(config, "mail", "to", required=True)
     mail_from = get_str(config, "mail", "from", default="")
     extra_body = get_str(config, "mail", "extra_body", default="")
 
-    # For SMTP, default sender can be the SMTP username.
+    if mqtt_enabled(config):
+        mqtt_topic = render_template(get_str(config, "mqtt", "topic", required=True), config)
+    else:
+        mqtt_topic = "(MQTT disabled)"
+
     if not mail_from and backend == "smtp":
         mail_from = get_str(config, "smtp", "username", default="")
-
-    # Final fallback sender address for local sendmail/Postfix.
     if not mail_from:
         mail_from = f"root@{hostname}"
-    # Choose subject template based on success or failure.
+
     if mail_type == "success":
         subject = get_str(
             config,
             "mail",
             "success_subject",
-            default="{hostname}: SUCCESS MQTT before {action}",
+            default="{hostname}: unattended-upgrades succeeded",
         )
-    # Failure path: optionally send failure mail and maybe abort.
     else:
         subject = get_str(
             config,
             "mail",
             "failure_subject",
-            default="{hostname}: FAILURE MQTT/power action",
+            default="{hostname}: unattended-upgrades failed",
         )
-
-    # Allow mail subject to use placeholders like {hostname} and {action}.
     subject = render_template(subject, config)
 
-    # Plain-text mail body with the most useful status information.
-    body = f"""Power action script status: {mail_type.upper()}
+    body = f"""my-unattended-upgrades status: {mail_type.upper()}
 
 Host: {hostname}
 Action: {action}
-
-MQTT topic: {mqtt_topic}
-MQTT message: {mqtt_message}
+Dry run: {'yes' if is_dry_run(config) else 'no'}
+MQTT status topic: {mqtt_topic}
 
 Details:
 {details}
 """
-
-    # Optional extra static text from the config is appended to the message.
     if extra_body:
-        body += f"""
+        body += f"\nExtra info:\n{extra_body}\n"
 
-Extra info:
-{extra_body}
-"""
-
-    # Build a standard Python EmailMessage object.
     msg = EmailMessage()
     msg["From"] = mail_from
     msg["To"] = mail_to
     msg["Subject"] = subject
     msg.set_content(body)
-
     return msg
 
 
-# Send mail using local sendmail/Postfix.
-# This is useful when the server already has local mail delivery configured.
 def send_mail_sendmail(config, msg: EmailMessage, mail_type: str) -> bool:
-    # Read optional custom sendmail path from config.
+    """Send an EmailMessage through local sendmail/Postfix."""
     sendmail_path = get_str(config, "sendmail", "path", default="")
     sendmail_bin = find_sendmail(sendmail_path)
-
     if not sendmail_bin:
         print("ERROR: Could not find sendmail. Install postfix or set [sendmail] path.")
         return False
 
     try:
-        # Feed the complete mail message to sendmail -t.
         subprocess.run(
             [sendmail_bin, "-t"],
             input=msg.as_bytes(),
             check=True,
             capture_output=True,
         )
-
         print(f"{mail_type.capitalize()} mail sent using sendmail.")
         return True
-
-    # systemctl returned a non-zero exit code.
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
-        print(f"ERROR: Failed to send {mail_type} mail using sendmail. Exit code: {e.returncode}")
-
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode(errors="replace").strip() if exc.stderr else ""
+        print(
+            f"ERROR: Failed to send {mail_type} mail using sendmail. "
+            f"Exit code: {exc.returncode}"
+        )
         if stderr:
             print(stderr)
-
+        return False
+    except Exception as exc:
+        print(f"ERROR: Failed to send {mail_type} mail using sendmail: {exc}")
         return False
 
-    except Exception as e:
-        print(f"ERROR: Failed to send {mail_type} mail using sendmail: {e}")
-        return False
 
-
-# Send mail directly through an SMTP server.
-# Supports normal STARTTLS on port 587 and SSL SMTP when configured.
 def send_mail_smtp(config, msg: EmailMessage, mail_type: str) -> bool:
-    # Read SMTP server settings from config.
+    """Send an EmailMessage directly through SMTP with SSL or STARTTLS."""
     host = get_str(config, "smtp", "host", default="smtp.gmail.com")
     port = get_int(config, "smtp", "port", default=587)
     username = get_str(config, "smtp", "username", required=True)
@@ -573,68 +495,60 @@ def send_mail_smtp(config, msg: EmailMessage, mail_type: str) -> bool:
     use_ssl = get_bool(config, "smtp", "ssl", default=False)
     use_starttls = get_bool(config, "smtp", "starttls", default=True)
     timeout = get_float(config, "smtp", "timeout", default=20.0)
-
     real_password = get_password(password, password_env)
 
-    # SMTP cannot continue without a resolved password.
     if not real_password:
         print("ERROR: SMTP password missing. Set [smtp] password or password_env.")
         return False
 
     try:
-        # SMTP_SSL connects with TLS from the beginning.
         if use_ssl:
             context = ssl.create_default_context()
-
             with smtplib.SMTP_SSL(host, port, timeout=timeout, context=context) as server:
                 server.login(username, real_password)
                 server.send_message(msg)
-
         else:
             with smtplib.SMTP(host, port, timeout=timeout) as server:
                 server.ehlo()
-
-                # STARTTLS upgrades the connection before login.
                 if use_starttls:
                     context = ssl.create_default_context()
                     server.starttls(context=context)
                     server.ehlo()
-
                 server.login(username, real_password)
                 server.send_message(msg)
 
         print(f"{mail_type.capitalize()} mail sent using SMTP.")
         return True
-
-    except Exception as e:
-        print(f"ERROR: Failed to send {mail_type} mail using SMTP: {e}")
+    except Exception as exc:
+        print(f"ERROR: Failed to send {mail_type} mail using SMTP: {exc}")
         return False
 
 
-# Pick the configured mail backend and send the prepared email.
-# [mail] backend decides whether sendmail or SMTP is used.
 def send_mail(config, mail_type: str, details: str) -> bool:
-    backend = get_str(config, "mail", "backend", default="sendmail")
-    # Build the message once, then pass it to the selected sender.
-    msg = build_mail_message(config, mail_type, details)
+    """Send configured mail, or intentionally skip it in dry-run mode."""
+    if is_dry_run(config) and not get_bool(
+        config, "mail", "send_on_dry_run", default=False
+    ):
+        print(f"DRY-RUN: {mail_type.capitalize()} mail not sent (send_on_dry_run=false).")
+        return True
 
+    backend = get_str(config, "mail", "backend", default="sendmail")
+    msg = build_mail_message(config, mail_type, details)
     if backend == "sendmail":
         return send_mail_sendmail(config, msg, mail_type)
-
     if backend == "smtp":
         return send_mail_smtp(config, msg, mail_type)
-
     print(f"ERROR: Unknown mail backend: {backend}")
     return False
 
 
-# Perform the configured power action.
-# In dry_run mode, it only prints the command instead of shutting down/rebooting.
 def run_power_action(config):
+    """Run shutdown/reboot, or explicitly do nothing for action=none."""
     action = get_str(config, "power", "action", required=True)
-    # dry_run is a safety option for testing without actually powering off.
-    dry_run = get_bool(config, "power", "dry_run", default=False)
 
+    if action == "none":
+        print("Power action is 'none'; skipping shutdown/reboot.")
+        return
     if action == "shutdown":
         command = ["systemctl", "poweroff"]
     elif action == "reboot":
@@ -642,8 +556,7 @@ def run_power_action(config):
     else:
         raise ValueError(f"Unknown action: {action}")
 
-    # In dry-run mode the script stops before running systemctl.
-    if dry_run:
+    if is_dry_run(config):
         print(f"DRY-RUN: Would run: {' '.join(command)}")
         return
 
@@ -651,101 +564,173 @@ def run_power_action(config):
     subprocess.run(command, check=True)
 
 
-# Parse command-line arguments.
-# The config file path is required so the script knows what settings to use.
-def parse_args():
-    # Create the command-line parser shown when using --help.
-    parser = argparse.ArgumentParser(
-        description="Send MQTT before shutdown/reboot using a config file."
+def systemd_failure_exit_code() -> int:
+    """Translate systemd ExecStopPost EXIT_CODE/EXIT_STATUS into a useful numeric JSON code."""
+    exit_code_kind = os.environ.get("EXIT_CODE", "")
+    exit_status = os.environ.get("EXIT_STATUS", "")
+    if exit_code_kind == "exited":
+        try:
+            return int(exit_status)
+        except (TypeError, ValueError):
+            pass
+    return 1
+
+
+def handle_systemd_stop_post(config) -> bool:
+    """Best-effort failure reporting when invoked by systemd as ExecStopPost.
+
+    systemd supplies SERVICE_RESULT/EXIT_CODE/EXIT_STATUS only to stop/post-stop commands.
+    Returning True tells main() that this invocation is status-only and must never run a
+    normal success path, delay, or power action.
+    """
+    if "SERVICE_RESULT" not in os.environ:
+        return False
+
+    service_result = os.environ.get("SERVICE_RESULT", "unknown")
+    if service_result == "success":
+        print("ExecStopPost: service completed successfully; no failure status needed.")
+        return True
+
+    exit_code_kind = os.environ.get("EXIT_CODE", "unknown")
+    exit_status = os.environ.get("EXIT_STATUS", "unknown")
+    code = systemd_failure_exit_code()
+    error_message = (
+        f"my-unattended-upgrades.service failed: SERVICE_RESULT={service_result}"
+    )
+    stderr_text = (
+        f"SERVICE_RESULT={service_result}; EXIT_CODE={exit_code_kind}; "
+        f"EXIT_STATUS={exit_status}. Check journalctl -u my-unattended-upgrades.service "
+        "for the full apt/unattended-upgrade output."
     )
 
-    # Require the path to the config file.
+    status_ok, status_details = publish_mqtt_status(
+        config,
+        success=False,
+        exit_code=code,
+        error_message=error_message,
+        stderr_text=stderr_text,
+    )
+    print(status_details)
+    if not status_ok:
+        # ExecStopPost reporting is intentionally best-effort so it never replaces the
+        # original service failure with an MQTT reporting failure.
+        print("ERROR: Could not publish MQTT JSON failure status; preserving original service failure.")
+
+    if get_bool(config, "mail", "on_failure", default=False):
+        mail_ok = send_mail(config, "failure", f"{error_message}\n{stderr_text}")
+        if not mail_ok:
+            print("ERROR: Could not send failure mail; preserving original service failure.")
+    return True
+
+
+def parse_args(argv=None):
+    """Parse the only application option: the required config-file path."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Publish Syncerate-style MQTT JSON status after unattended-upgrades, "
+            "optionally send mail, and optionally shut down or reboot."
+        )
+    )
     parser.add_argument(
         "-c",
         "--config",
         required=True,
-        help="Path to config file.",
+        help="Path to the INI configuration file.",
     )
+    return parser.parse_args(argv)
 
-    return parser.parse_args()
 
-
-# Main program flow:
-# 1. Parse arguments.
-# 2. Load and validate config.
-# 3. Publish MQTT.
-# 4. Send optional mail.
-# 5. Wait if configured.
-# 6. Run shutdown/reboot unless dry_run is enabled.
-def main():
-    # Read command-line arguments first.
-    args = parse_args()
-    # Load and validate config before doing any external actions.
+def main(argv=None) -> int:
+    """Run normal post-upgrade handling or systemd ExecStopPost failure reporting."""
+    args = parse_args(argv)
     config = load_config(args.config)
+
+    if handle_systemd_stop_post(config):
+        return 0
 
     mail_on_success = get_bool(config, "mail", "on_success", default=False)
     mail_on_failure = get_bool(config, "mail", "on_failure", default=False)
+    continue_on_mqtt_fail = get_bool(
+        config, "power", "continue_on_mqtt_fail", default=False
+    )
+    continue_on_mail_fail = get_bool(
+        config, "power", "continue_on_mail_fail", default=False
+    )
+    delay_before_action = get_float(
+        config, "power", "delay_before_action", default=1.0
+    )
+    action = get_str(config, "power", "action", required=True)
 
-    # These flags decide whether to continue or abort after MQTT/mail failures.
-    continue_on_mqtt_fail = get_bool(config, "power", "continue_on_mqtt_fail", default=False)
-    continue_on_mail_fail = get_bool(config, "power", "continue_on_mail_fail", default=False)
+    # Mail runs before the success MQTT event so Home Assistant receives success only after
+    # all configured blocking notification work has passed its failure policy.
+    mail_warning = False
+    if mail_on_success:
+        mail_ok = send_mail(
+            config,
+            "success",
+            "apt-get update and unattended-upgrade completed successfully.",
+        )
+        if not mail_ok:
+            mail_warning = True
+            details = "Success mail failed after unattended-upgrades completed."
+            if mail_on_failure:
+                send_mail(config, "failure", details)
+            if not continue_on_mail_fail:
+                status_ok, status_details = publish_mqtt_status(
+                    config,
+                    success=False,
+                    exit_code=1,
+                    error_message=details,
+                    stderr_text=details,
+                )
+                print(status_details)
+                print("Aborting power action because success mail failed.")
+                return 1
+            print("WARNING: Continuing because continue_on_mail_fail=true.")
 
-    # Optional delay gives Home Assistant/mail time before shutdown/reboot.
-    delay_before_action = get_float(config, "power", "delay_before_action", default=1.0)
-
-    # Send the MQTT message before doing the power action.
-    mqtt_ok, mqtt_details = publish_mqtt(config)
-
-    print(mqtt_details)
-
-    # Success path: optionally send success mail.
-    if mqtt_ok:
-        if mail_on_success:
-            mail_ok = send_mail(config, "success", mqtt_details)
-
-            if not mail_ok:
-                if mail_on_failure:
-                    send_mail(config, "failure", "Success mail failed after MQTT succeeded.")
-
-                if not continue_on_mail_fail:
-                    print("Aborting power action because success mail failed.")
-                    sys.exit(1)
-
-    else:
+    status_ok, status_details = publish_mqtt_status(
+        config,
+        success=True,
+        exit_code=0,
+        warning=mail_warning,
+    )
+    print(status_details)
+    if not status_ok:
         if mail_on_failure:
-            send_mail(config, "failure", mqtt_details)
-
+            send_mail(config, "failure", status_details)
         if not continue_on_mqtt_fail:
-            print("Aborting power action because MQTT publish failed.")
-            sys.exit(1)
+            print("Aborting power action because MQTT JSON status publish failed.")
+            return 1
+        print("WARNING: Continuing because continue_on_mqtt_fail=true.")
 
-    # Wait only when the configured delay is above zero.
+    # action=none is the sequencing mode: notifications are handled, but no delay or
+    # systemctl power operation is performed.
+    if action == "none":
+        run_power_action(config)
+        return 0
+
     if delay_before_action > 0:
         time.sleep(delay_before_action)
 
     try:
         run_power_action(config)
-
-    except subprocess.CalledProcessError as e:
-        details = f"Power action failed with exit code {e.returncode}"
+    except subprocess.CalledProcessError as exc:
+        details = f"Power action failed with exit code {exc.returncode}"
         print(f"ERROR: {details}")
-
         if mail_on_failure:
             send_mail(config, "failure", details)
-
-        sys.exit(e.returncode)
-
-    except Exception as e:
-        details = f"Power action failed: {e}"
+        # Under systemd, ExecStopPost will publish the final failure JSON using the real
+        # service result. A manual invocation still returns the non-zero power-action code.
+        return exc.returncode or 1
+    except Exception as exc:
+        details = f"Power action failed: {exc}"
         print(f"ERROR: {details}")
-
         if mail_on_failure:
             send_mail(config, "failure", details)
+        return 1
 
-        sys.exit(1)
+    return 0
 
 
-# Only run main() when this file is executed directly.
-# This prevents the script from running automatically if imported by another Python file.
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
