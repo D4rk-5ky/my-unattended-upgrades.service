@@ -1,0 +1,333 @@
+alias: Weekly Update - With My Unattended Upgrades (Parallel)
+description: >
+  Wake multiple computers in parallel and start My Unattended Upgrades
+  independently on each computer.
+
+  MQTT JSON result messages are handled independently as they arrive.
+
+  Each computer can therefore finish at a different time and receive its own
+  Success, Failure, or Unknown handling without affecting the other computers.
+
+triggers:
+  - trigger: time
+    at: sensor.daily_backup_cheapest_start
+    weekday:
+      - wed
+    id: cheapest_start
+    enabled: false
+
+  - trigger: mqtt
+    id: Computer A
+    options:
+      topic: homeassistant/my-unattended-upgrades/computer-a/status
+
+  - trigger: mqtt
+    id: Computer B
+    options:
+      topic: homeassistant/my-unattended-upgrades/computer-b/status
+
+  - trigger: mqtt
+    id: backup_sequence_complete
+    options:
+      topic: homeassistant/my-unattended-upgrades/start
+      payload: start
+
+conditions: []
+
+actions:
+  - choose:
+      - alias: Start weekly updates
+        conditions:
+          - condition: trigger
+            id:
+              - cheapest_start
+              - backup_sequence_complete
+        sequence:
+          - alias: Wake and start all computers independently
+            parallel:
+              - sequence:
+                  - alias: Computer A - Wake only when offline
+                    if:
+                      - condition: not
+                        conditions:
+                          - condition: state
+                            entity_id: binary_sensor.computer_a_online
+                            state: "on"
+                    then:
+                      - alias: Computer A - Power on
+                        action: switch.turn_on
+                        target:
+                          entity_id: switch.computer_a_power
+                        data: {}
+
+                  - alias: Computer A - Wait for computer
+                    wait_template: |
+                      {{
+                        is_state(
+                          'binary_sensor.computer_a_online',
+                          'on'
+                        )
+                      }}
+                    timeout: "00:10:00"
+                    continue_on_timeout: true
+
+                  - alias: Computer A - Start update if online
+                    if:
+                      - condition: state
+                        entity_id: binary_sensor.computer_a_online
+                        state: "on"
+                    then:
+                      - alias: Computer A - Wait 5 minutes after boot
+                        delay: "00:05:00"
+
+                      - alias: Computer A - Start My Unattended Upgrades
+                        action: mqtt.publish
+                        data:
+                          topic: homeassistant/mqtt-listener/computer-a
+                          payload: start_myunattendedupgrades
+                          qos: 0
+                          retain: false
+
+                    else:
+                      - alias: Computer A - Boot timeout notification
+                        action: notify.pushover
+                        continue_on_error: true
+                        data:
+                          title: ❌ Computer A update could not start
+                          message: >
+                            Computer A did not become available within
+                            10 minutes.
+
+                            My Unattended Upgrades was NOT started on this
+                            computer.
+
+                            The other computers in the weekly update run are not
+                            affected by this failure.
+                          data:
+                            priority: 1
+                            sound: siren
+
+              - sequence:
+                  - alias: Computer B - Wake only when offline
+                    if:
+                      - condition: not
+                        conditions:
+                          - condition: state
+                            entity_id: binary_sensor.computer_b_online
+                            state: "on"
+                    then:
+                      - alias: Computer B - Power on
+                        action: switch.turn_on
+                        target:
+                          entity_id: switch.computer_b_power
+                        data: {}
+
+                  - alias: Computer B - Wait for computer
+                    wait_template: |
+                      {{
+                        is_state(
+                          'binary_sensor.computer_b_online',
+                          'on'
+                        )
+                      }}
+                    timeout: "00:10:00"
+                    continue_on_timeout: true
+
+                  - alias: Computer B - Start update if online
+                    if:
+                      - condition: state
+                        entity_id: binary_sensor.computer_b_online
+                        state: "on"
+                    then:
+                      - alias: Computer B - Wait 5 minutes after boot
+                        delay: "00:05:00"
+
+                      - alias: Computer B - Start My Unattended Upgrades
+                        action: mqtt.publish
+                        data:
+                          topic: homeassistant/mqtt-listener/computer-b
+                          payload: start_myunattendedupgrades
+                          qos: 0
+                          retain: false
+
+                    else:
+                      - alias: Computer B - Boot timeout notification
+                        action: notify.pushover
+                        continue_on_error: true
+                        data:
+                          title: ❌ Computer B update could not start
+                          message: >
+                            Computer B did not become available within
+                            10 minutes.
+
+                            My Unattended Upgrades was NOT started on this
+                            computer.
+
+                            The other computers in the weekly update run are not
+                            affected by this failure.
+                          data:
+                            priority: 1
+                            sound: siren
+
+      - alias: Handle My Unattended Upgrades MQTT result
+        conditions:
+          - condition: trigger
+            id:
+              - Computer A
+              - Computer B
+        sequence:
+          - alias: Read MQTT JSON report
+            variables:
+              report: |
+                {{
+                  trigger.payload_json
+                  if trigger.payload_json is defined
+                  and trigger.payload_json is mapping
+                  else {}
+                }}
+
+              mqtt_status: |
+                {{
+                  report.status
+                  | default('unknown')
+                  | string
+                  | trim
+                  | lower
+                }}
+
+              report_title: |
+                {{
+                  report.title
+                  | default(
+                      report.name
+                      | default(
+                          report.job
+                          | default('My Unattended Upgrades')
+                      )
+                  )
+                }}
+
+          - alias: Choose action from received result
+            choose:
+              - alias: Successful update
+                conditions:
+                  - condition: template
+                    value_template: |
+                      {{
+                        mqtt_status in [
+                          'success',
+                          'successful',
+                          'successfull'
+                        ]
+                      }}
+                sequence:
+                  - alias: Send successful update notification
+                    action: notify.pushover
+                    continue_on_error: true
+                    data:
+                      title: ✅ Update completed successfully
+                      message: >
+                        {{ report_title }} finished successfully.
+
+                        Computer: {{ trigger.id }}
+
+                        Exit code: {{ report.exit_code | default('unknown') }}
+
+                        {% if report.warning | default(false) | bool(false) %}
+                        Warning: My Unattended Upgrades completed with one or
+                        more non-fatal warnings.
+                        {% endif %}
+                      data:
+                        priority: 0
+                        sound: pushover
+
+                  - alias: Computer specific success action
+                    choose:
+                      - alias: Computer A - Success
+                        conditions:
+                          - condition: trigger
+                            id:
+                              - Computer A
+                        sequence:
+                          - alias: Computer A - Request delayed shutdown
+                            action: mqtt.publish
+                            data:
+                              topic: homeassistant/mqtt-listener/computer-a
+                              payload: shutdown_delay
+                              qos: 0
+                              retain: false
+
+                          - alias: Computer A - Run safe shutdown script
+                            action: script.turn_on
+                            target:
+                              entity_id: script.computer_a_safe_shutdown
+                            data: {}
+
+                      - alias: Computer B - Success
+                        conditions:
+                          - condition: trigger
+                            id:
+                              - Computer B
+                        sequence:
+                          - alias: Computer B - Request delayed shutdown
+                            action: mqtt.publish
+                            data:
+                              topic: homeassistant/mqtt-listener/computer-b
+                              payload: shutdown_delay
+                              qos: 0
+                              retain: false
+
+              - alias: Failed update
+                conditions:
+                  - condition: template
+                    value_template: |
+                      {{
+                        mqtt_status in [
+                          'failure',
+                          'failed'
+                        ]
+                      }}
+                sequence:
+                  - alias: Send failed update notification
+                    action: notify.pushover
+                    continue_on_error: true
+                    data:
+                      title: ❌ My Unattended Upgrades failed
+                      message: |
+                        {{ report_title }} failed.
+                        Computer: {{ trigger.id }}
+                        Exit code: {{ report.exit_code | default('unknown') }}
+                        Error: {{ report.error | default('No error message') }}
+                        Last stderr/output: {{
+                          report.stderr
+                          | default('No stderr captured')
+                        }}
+                      data:
+                        priority: 1
+                        sound: siren
+
+            default:
+              - alias: Send unknown result notification
+                action: notify.pushover
+                continue_on_error: true
+                data:
+                  title: ❔ My Unattended Upgrades status unknown
+                  message: >
+                    Received an MQTT status that was neither success nor
+                    failure.
+
+                    Computer: {{ trigger.id }}
+
+                    Status: {{ mqtt_status }}
+
+                    Title: {{ report_title }}
+
+                    MQTT topic: {{ trigger.topic }}
+
+                    Raw payload: {{ trigger.payload | default('No payload') }}
+                  data:
+                    priority: 0
+                    sound: pushover
+
+mode: parallel
+max: 20
